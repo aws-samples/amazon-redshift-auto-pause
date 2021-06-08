@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  Cluster:
+    Description: The Amazon Redshift cluster name.
+    Type: String
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9-]*"
+  Database:
+    Description: The name of the database which will be used in the connection.
+    Type: String
+    AllowedPattern: "([a-z]|[0-9])+"
+  User:
+    Description: The user which will be used to check for activity.
+    Type: String
+    AllowedPattern: "([a-z]|[0-9])+"
+  Schedule:
+    Description: The user which will be used to check for activity.
+    Type: String
+    Default: rate(1 hour)
+  Topic:
+    Description: (Optional) If populated, will send a message to the SNS Topic when the cluster is paused.
+    Type: String
+  Email:
+    Type: String
+    Description: (Optional) If populated, will create a new SNS topic using the above Topic Name along with a subscription using this Email address.
+Conditions:  
+  IsSNSTopicEmpty: !And
+    - !Not [!Equals [!Ref Topic, ""]] 
+    - !Not [!Equals [!Ref Email, ""]]    
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Parameters:
+          - Cluster
+          - Database
+          - User
+          - Schedule
+          - Topic
+          - Email
+Resources:
+  LambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            -
+              Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+      Path: /
+      Policies:
+          -
+            PolicyName: PauseClusterRedshiftPolicy
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                -
+                  Effect: Allow
+                  Action:
+                    - redshift:GetClusterCredentials
+                    - redshift:PauseCluster
+                    - redshift:DescribeClusters
+                  Resource:
+                    - !Sub "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbname:${Cluster}/${Database}"
+                    - !Sub "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbuser:${Cluster}/${User}"
+                    - !Sub "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${Cluster}"
+                -
+                  Effect: Allow
+                  Action:
+                    - redshift-data:*
+                    - sns:Publish
+                  Resource: "*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  LambdaFunction:
+     Type: "AWS::Lambda::Function"
+     Properties:
+       Role: !GetAtt 'LambdaIAMRole.Arn'
+       Timeout: 300
+       Code:
+         ZipFile: |
+            #!/usr/bin/python
+            import os, boto3, time
+
+            def lambda_handler(event, context):
+                redshift_data_client = boto3.client("redshift-data")
+                redshift_admin_client = boto3.client("redshift")
+                redshift_cluster_id = event['redshift_cluster_id']
+                redshift_database = event['redshift_database']
+                redshift_user = event['redshift_user']
+                region = context.invoked_function_arn.split(":")[3]
+                account = context.invoked_function_arn.split(":")[4]
+                sns_topic = event['sns_topic']
+                clusterStatusResponse = redshift_admin_client.describe_clusters(ClusterIdentifier=redshift_cluster_id)
+                clusterStatus = clusterStatusResponse['Clusters'][0]['ClusterStatus']
+                if clusterStatus == "paused":
+                    print("Cluster {} is already in paused state".format(redshift_cluster_id))
+                else:  
+                    sql_statement = "\
+                        create table if not exists autopause_log ( \
+                            log_ts datetime, \
+                            query_cnt int, \
+                            status varchar(10));"
+                    query_id = redshift_data_client.execute_statement(Database=redshift_database, DbUser=redshift_user,Sql=sql_statement, ClusterIdentifier=redshift_cluster_id)["Id"]
+
+                    sql_statement = "\
+                      select count(1) query_cnt, current_timestamp AT TIME ZONE 'UTC' log_ts \
+                      from stv_inflight \
+                      where userid != 1 \
+                        and text not like '%stv_inflight%';"
+                    query_id = redshift_data_client.execute_statement(Database=redshift_database, DbUser=redshift_user,Sql=sql_statement, ClusterIdentifier=redshift_cluster_id)["Id"]
+
+                    statuslist = ["SUBMITTED", "PICKED", "STARTED"]
+                    while (redshift_data_client.describe_statement(Id=query_id)["Status"] in statuslist) :
+                        time.sleep(3)
+
+                    query_cnt = redshift_data_client.get_statement_result(Id=query_id)["Records"][0][0]["longValue"]
+                    log_ts = redshift_data_client.get_statement_result(Id=query_id)["Records"][0][1]["stringValue"]
+                    if (query_cnt==0):
+                        status = "Pause"
+                        print("No activity in cluster {}".format(redshift_cluster_id))
+                    else :
+                        status = "Active"
+                        print(str(query_cnt) + " queries are running")
+                    sql_statement = "insert into autopause_log (log_ts,query_cnt,status) values ('"+log_ts+"',"+str(query_cnt)+",'"+status+"');"
+                    redshift_data_client.execute_statement(Database=redshift_database, DbUser=redshift_user,Sql=sql_statement, ClusterIdentifier=redshift_cluster_id)
+
+                    if (query_cnt == 0):
+                        print("Pausing the cluster {}".format(redshift_cluster_id))
+                        if (sns_topic != ""):
+                            print("Sending SNS Notification to topic: " + sns_topic)
+                            topic = "arn:aws:sns:"+region+":"+account+":"+sns_topic
+                            sns = boto3.client("sns")
+                            sns.publish(
+                                TopicArn=topic,
+                                Message="There was no activity as of "+log_ts+" in Redshift Cluster: "+redshift_cluster_id+" and it will be paused.",
+                                Subject="Pausing cluster: " + redshift_cluster_id)
+                        redshift_admin_client.pause_cluster(ClusterIdentifier=redshift_cluster_id)
+
+       Handler: index.lambda_handler
+       Runtime: python3.8
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression:
+        Ref: Schedule
+      Targets:
+        -
+          Arn:
+            Fn::GetAtt:
+              - "LambdaFunction"
+              - "Arn"
+          Input: !Sub "{\"redshift_cluster_id\":\"${Cluster}\", \"redshift_database\":\"${Database}\", \"redshift_user\":\"${User}\", \"sns_topic\":\"${Topic}\"}"
+          Id: !Sub "${AWS::StackName}"
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub "${LambdaFunction}"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - "EventRule"
+          - "Arn"
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsSNSTopicEmpty
+    Properties:
+      Subscription:
+        - Endpoint: !Sub "${Email}"
+          Protocol: email
+      TopicName: !Sub "${Topic}"
+    

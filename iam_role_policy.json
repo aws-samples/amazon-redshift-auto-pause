@@ -1,0 +1,28 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ClusterCredentials",
+            "Effect": "Allow",
+            "Action": [
+                "redshift:GetClusterCredentials",
+                "redshift:PauseCluster",
+                "redshift:DescribeClusters"
+            ],
+            "Resource": [
+                "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbname:${Cluster}/${Database}",
+                "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbuser:${Cluster}/${User}",
+                "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${Cluster}"
+            ]
+        },
+        {
+            "Sid": "RedshiftDataAPI",
+            "Effect": "Allow",
+            "Action": [
+                "redshift-data:*", 
+                "sns:Publish"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
