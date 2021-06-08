@@ -1,6 +1,6 @@
 ## Overview
 
-Customers who use Redshift on-demand may need a mechanism to pause their Redshift cluster when it’s not in use.  This project shows how you can use lambda to auto-pause your Redshift Cluster.  It will check for user activity using a user-defined interval and if there is no activity, the cluster will automatically paused.  
+Customers who use Redshift on-demand may need a mechanism to pause their Redshift cluster when it’s not in use.  This project shows how you can use lambda to auto-pause your Redshift Cluster.  It will check for user activity using a user-defined interval and if there is no activity, the cluster will be paused.  
 
 ## Architecture
 
