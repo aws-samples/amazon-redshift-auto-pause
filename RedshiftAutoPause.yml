@@ -174,4 +174,5 @@ Resources:
         - Endpoint: !Sub "${Email}"
           Protocol: email
       TopicName: !Sub "${Topic}"
+      KmsMasterKeyId: alias/aws/sns
     
